@@ -68,9 +68,13 @@ export const LiveFieldTrackingView: React.FC = () => {
     );
   }
 
-  // Initial load: Fetch server locations immediately
+  // Initial load & periodic reconciliation: Fetch server locations immediately and every 10 seconds
   useEffect(() => {
     liveLocationService.fetchServerLocations();
+    const interval = setInterval(() => {
+      liveLocationService.fetchServerLocations();
+    }, 10000);
+    return () => clearInterval(interval);
   }, []);
 
   // Listen to Pusher connection state changes

@@ -219,11 +219,8 @@ class LiveLocationService {
       }
     }
 
-    const fieldWorkers = allEmployees.filter((emp) =>
-      this.isEligibleFieldWorker(emp.systemRole || emp.designation, emp.department)
-    );
-
-    fieldWorkers.forEach((emp) => {
+    // Initialize all existing staff in the system so Admin has baseline metadata
+    allEmployees.forEach((emp) => {
       // Find assigned solar project if available
       const assignedProject = allProjects.find(
         (p) =>
@@ -239,14 +236,14 @@ class LiveLocationService {
         typeof cached.longitude === 'number';
 
       const lastSeenMs = cached?.lastSeenAt ? new Date(cached.lastSeenAt).getTime() : 0;
-      const isOnline = Date.now() - lastSeenMs < PRESENCE_TIMEOUT_MS;
+      const isOnline = lastSeenMs > 0 && Date.now() - lastSeenMs < PRESENCE_TIMEOUT_MS;
 
       const record: LiveEmployeeLocation = {
         userId: emp.id,
-        employeeCode: emp.employeeCode,
+        employeeCode: emp.employeeCode || emp.id,
         name: emp.name,
         email: emp.email,
-        role: emp.systemRole || emp.designation,
+        role: emp.systemRole || emp.designation || 'Field Worker',
         avatar: emp.photoUrl,
         phone: emp.phone,
         department: emp.department,
@@ -316,22 +313,32 @@ class LiveLocationService {
       const data = await res.json();
       if (!data.success || !Array.isArray(data.locations)) return;
 
+      const now = Date.now();
+
+      // Process and deduplicate server records
       data.locations.forEach((srv: any) => {
         if (!srv || !srv.userId) return;
         const targetId = this.resolveCanonicalId(srv.userId, srv.email, srv.employeeCode);
         const existing = this.employeeLocations.get(targetId);
 
         const hasCoords = typeof srv.latitude === 'number' && typeof srv.longitude === 'number';
-        const now = Date.now();
         const lastSeenMs = srv.lastSeenAt ? new Date(srv.lastSeenAt).getTime() : 0;
-        const isOnline = Boolean(srv.isOnline) && (now - lastSeenMs < PRESENCE_TIMEOUT_MS);
+        const existingLastSeenMs = existing?.lastSeenAt ? new Date(existing.lastSeenAt).getTime() : 0;
+
+        // Guard against older server snapshot clobbering newer local presence fix
+        if (existing && existing.isOnline && srv.lastSeenAt && lastSeenMs < existingLastSeenMs && !srv.isOnline) {
+          return;
+        }
+
+        // Presence is online if server marked online or within timeout window
+        const isOnline = Boolean(srv.isOnline) || (lastSeenMs > 0 && Math.abs(now - lastSeenMs) < PRESENCE_TIMEOUT_MS);
+        const effectiveLastSeen = srv.lastSeenAt || existing?.lastSeenAt || new Date().toISOString();
 
         if (existing) {
-          // Always apply server presence state and lastSeenAt
-          if (srv.lastSeenAt) {
-            existing.lastSeenAt = srv.lastSeenAt;
-            existing.isOnline = isOnline;
-          }
+          // Always apply authoritative server presence state
+          existing.isOnline = isOnline;
+          existing.lastSeenAt = effectiveLastSeen;
+
           if (typeof srv.isSharingLocation === 'boolean') {
             existing.isSharingLocation = srv.isSharingLocation;
           }
@@ -353,7 +360,7 @@ class LiveLocationService {
             existing.speed = srv.speed;
             existing.batteryLevel = srv.batteryLevel ?? existing.batteryLevel;
             existing.currentActivity = srv.activity || existing.currentActivity;
-            existing.updatedAt = srv.updatedAt || srv.lastSeenAt || existing.updatedAt;
+            existing.updatedAt = srv.updatedAt || effectiveLastSeen;
 
             if (existing.assignedSiteCoordinates) {
               existing.distanceToSiteKm = calculateDistanceKm(
@@ -365,9 +372,10 @@ class LiveLocationService {
             }
           }
 
+          // Presence is independent of GPS: online employees without GPS are status 'online'
           existing.status = !isOnline
             ? 'offline'
-            : existing.hasLocation
+            : existing.hasLocation && typeof existing.latitude === 'number'
             ? ((existing.speed || 0) > 3 ? 'moving' : 'idle')
             : 'online';
 
@@ -379,7 +387,7 @@ class LiveLocationService {
 
           this.employeeLocations.set(targetId, { ...existing });
         } else {
-          // Add newly discovered field worker from server
+          // Add newly discovered worker dynamically even if not in storage
           const newRecord: LiveEmployeeLocation = {
             userId: targetId,
             employeeCode: srv.employeeCode || targetId,
@@ -390,7 +398,7 @@ class LiveLocationService {
             department: 'Operations',
             isOnline,
             isSharingLocation: srv.isSharingLocation ?? true,
-            lastSeenAt: srv.lastSeenAt,
+            lastSeenAt: effectiveLastSeen,
             latitude: hasCoords ? srv.latitude : undefined,
             longitude: hasCoords ? srv.longitude : undefined,
             hasLocation: hasCoords,
@@ -398,8 +406,12 @@ class LiveLocationService {
             heading: srv.heading,
             speed: srv.speed,
             batteryLevel: srv.batteryLevel,
-            currentActivity: srv.activity || (isOnline ? (hasCoords ? 'Active' : 'Online • Standby') : 'Offline'),
-            updatedAt: srv.updatedAt || srv.lastSeenAt || new Date().toISOString(),
+            currentActivity: !isOnline
+              ? 'Offline'
+              : hasCoords
+              ? (srv.speed && srv.speed > 3 ? 'In Transit / Moving' : 'On Site / Active')
+              : (srv.isSharingLocation ? 'Online • Awaiting GPS fix' : 'Online • Standby'),
+            updatedAt: srv.updatedAt || effectiveLastSeen,
             status: !isOnline ? 'offline' : hasCoords ? ((srv.speed || 0) > 3 ? 'moving' : 'idle') : 'online'
           };
           this.employeeLocations.set(targetId, newRecord);
@@ -427,7 +439,7 @@ class LiveLocationService {
       return;
     }
 
-    const canonicalId = this.resolveCanonicalId(payload.userId);
+    const canonicalId = this.resolveCanonicalId(payload.userId, undefined, payload.employeeCode);
     const existing = this.employeeLocations.get(canonicalId);
     const speed = payload.speed !== undefined ? payload.speed : 0;
     const isMoving = speed > 3;
@@ -453,6 +465,14 @@ class LiveLocationService {
         status: isMoving ? 'moving' : 'idle'
       };
 
+      if (payload.name && (!updated.name || updated.name.startsWith('Field Worker ('))) {
+        updated.name = payload.name;
+      }
+      if (payload.role) updated.role = payload.role;
+      if (payload.employeeCode && (!updated.employeeCode || updated.employeeCode === updated.userId)) {
+        updated.employeeCode = payload.employeeCode;
+      }
+
       if (updated.assignedSiteCoordinates) {
         updated.distanceToSiteKm = calculateDistanceKm(
           payload.latitude,
@@ -465,9 +485,10 @@ class LiveLocationService {
     } else {
       // Dynamic worker entry if not previously configured
       updated = {
-        userId: payload.userId,
-        name: `Field Worker (${payload.userId.slice(0, 6)})`,
-        role: 'Technician',
+        userId: canonicalId,
+        employeeCode: payload.employeeCode || canonicalId,
+        name: payload.name || `Field Worker (${canonicalId.slice(0, 6)})`,
+        role: payload.role || 'Field Engineer',
         phone: '+91 98250 00000',
         department: 'Operations',
         isOnline: true,
@@ -484,11 +505,17 @@ class LiveLocationService {
         lastSeenAt: timestamp,
         status: isMoving ? 'moving' : 'idle'
       };
-      this.employeeLocations.set(payload.userId, updated);
-      this.alternateIdMap.set(payload.userId.toLowerCase(), payload.userId);
+      this.employeeLocations.set(canonicalId, updated);
+      this.alternateIdMap.set(canonicalId.toLowerCase(), canonicalId);
+      if (payload.userId !== canonicalId) {
+        this.alternateIdMap.set(payload.userId.toLowerCase(), canonicalId);
+      }
+      if (payload.employeeCode) {
+        this.alternateIdMap.set(payload.employeeCode.toLowerCase(), canonicalId);
+      }
     }
 
-    this.persistRealLocation(updated.userId, updated);
+    this.persistRealLocation(canonicalId, updated);
     this.notifyListeners();
   }
 
@@ -509,6 +536,15 @@ class LiveLocationService {
     const existing = this.employeeLocations.get(canonicalId);
     const isOnline = Boolean(payload.isOnline);
     const timestamp = payload.lastSeenAt || new Date().toISOString();
+    const payloadTime = new Date(timestamp).getTime();
+    const existingTime = existing?.lastSeenAt ? new Date(existing.lastSeenAt).getTime() : 0;
+
+    // Guard against out-of-order older Pusher events marking a newer online user offline
+    if (existing && existing.isOnline && payloadTime < existingTime && !isOnline) {
+      return;
+    }
+
+    const hasPayloadCoords = typeof payload.latitude === 'number' && typeof payload.longitude === 'number';
 
     if (existing) {
       existing.isOnline = isOnline;
@@ -526,11 +562,21 @@ class LiveLocationService {
       }
       if (payload.email && !existing.email) existing.email = payload.email;
 
+      if (hasPayloadCoords) {
+        existing.latitude = payload.latitude;
+        existing.longitude = payload.longitude;
+        existing.hasLocation = true;
+        if (payload.accuracy !== undefined) existing.accuracy = payload.accuracy;
+        if (payload.speed !== undefined) existing.speed = payload.speed;
+      }
+
+      const hasCoords = Boolean(existing.hasLocation && typeof existing.latitude === 'number' && typeof existing.longitude === 'number');
+
       // Determine status independently from GPS
       if (!isOnline) {
         existing.status = 'offline';
         existing.currentActivity = 'Offline';
-      } else if (existing.hasLocation && typeof existing.latitude === 'number' && typeof existing.longitude === 'number') {
+      } else if (hasCoords) {
         existing.status = (existing.speed && existing.speed > 3) ? 'moving' : 'idle';
         existing.currentActivity = (existing.speed && existing.speed > 3) ? 'In Transit / Moving' : 'On Site / Active';
       } else {
@@ -544,7 +590,7 @@ class LiveLocationService {
       this.persistRealLocation(canonicalId, existing);
     } else {
       // Dynamic worker entry if receiving presence for a worker not yet in local state
-      const hasCoords = typeof payload.latitude === 'number' && typeof payload.longitude === 'number';
+      const hasCoords = hasPayloadCoords;
       const newRecord: LiveEmployeeLocation = {
         userId: canonicalId,
         employeeCode: payload.employeeCode || canonicalId,
@@ -563,7 +609,11 @@ class LiveLocationService {
         accuracy: payload.accuracy,
         speed: payload.speed,
         status: !isOnline ? 'offline' : hasCoords ? ((payload.speed || 0) > 3 ? 'moving' : 'idle') : 'online',
-        currentActivity: isOnline ? (hasCoords ? 'Active' : 'Online • Standby') : 'Offline'
+        currentActivity: !isOnline
+          ? 'Offline'
+          : hasCoords
+          ? ((payload.speed || 0) > 3 ? 'In Transit / Moving' : 'On Site / Active')
+          : (payload.isSharingLocation ? 'Online • Awaiting GPS fix' : 'Online • Standby')
       };
       this.employeeLocations.set(canonicalId, newRecord);
       this.alternateIdMap.set(canonicalId.toLowerCase(), canonicalId);
@@ -595,7 +645,7 @@ class LiveLocationService {
     this.employeeLocations.forEach((emp) => {
       if (emp.isOnline) {
         const lastSeenMs = emp.lastSeenAt ? new Date(emp.lastSeenAt).getTime() : 0;
-        if (now - lastSeenMs > PRESENCE_TIMEOUT_MS) {
+        if (lastSeenMs > 0 && now - lastSeenMs > PRESENCE_TIMEOUT_MS) {
           emp.isOnline = false;
           emp.isSharingLocation = false;
           emp.status = 'offline';
@@ -655,6 +705,9 @@ class LiveLocationService {
   ): Promise<boolean> {
     const payload: LocationUpdatePayload = {
       userId,
+      employeeCode: coords.employeeCode,
+      name: coords.name,
+      role: coords.role,
       latitude: coords.latitude,
       longitude: coords.longitude,
       accuracy: coords.accuracy,

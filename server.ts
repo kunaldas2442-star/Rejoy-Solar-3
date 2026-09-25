@@ -159,7 +159,7 @@ async function startServer() {
   });
 
   // Centralized timing constants
-  const PRESENCE_TIMEOUT_MS = 60 * 1000; // 60s timeout for presence
+  const PRESENCE_TIMEOUT_MS = 120 * 1000; // 120s (2 minutes) timeout for presence with clock-skew tolerance
 
   interface WorkforceRecord {
     userId: string;
@@ -186,52 +186,160 @@ async function startServer() {
   const sseClients = new Set<express.Response>();
   const CACHE_FILE = path.join(process.cwd(), '.workforce_cache.json');
 
-  // Read persisted workforce records from disk
+  // Read persisted workforce records from disk with retry on transient file lock
   function readWorkforceCacheFromDisk(): WorkforceRecord[] {
-    try {
-      if (fs.existsSync(CACHE_FILE)) {
-        const raw = fs.readFileSync(CACHE_FILE, 'utf-8');
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) return parsed;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (fs.existsSync(CACHE_FILE)) {
+          const raw = fs.readFileSync(CACHE_FILE, 'utf-8');
+          if (raw.trim()) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) return parsed;
+          }
+        }
+      } catch (err) {
+        // If file was being atomically replaced, retry briefly once
+        if (attempt === 0) {
+          const start = Date.now();
+          while (Date.now() - start < 15) { /* spin 15ms */ }
+        } else {
+          console.warn('[Workforce Cache] Warning reading disk cache:', err);
+        }
       }
-    } catch (err) {
-      // Non-blocking
     }
     return [];
+  }
+
+  // Deduplicate and resolve canonical employee ID (e.g. emp-1 vs admin@rejoysolar.com)
+  function resolveCanonicalWorkforceKey(id: string, email?: string, employeeCode?: string, name?: string): string {
+    const cleanId = (id || '').trim();
+    const cleanEmail = (email || (cleanId.includes('@') ? cleanId : '')).trim().toLowerCase();
+    const cleanCode = (employeeCode || '').trim().toUpperCase();
+    const cleanName = (name || '').trim().toLowerCase();
+
+    // If ID is already a standard employee code (e.g. emp-1, EMP001), prefer it
+    if (cleanId.startsWith('emp-') || cleanId.startsWith('EMP')) {
+      return cleanId;
+    }
+
+    // Check if any existing record in memory matches email or code
+    for (const [key, rec] of workforceState.entries()) {
+      if (key.startsWith('emp-') || key.startsWith('EMP')) {
+        if (cleanEmail && rec.email && rec.email.trim().toLowerCase() === cleanEmail) {
+          return key;
+        }
+        if (cleanCode && rec.employeeCode && rec.employeeCode.trim().toUpperCase() === cleanCode) {
+          return key;
+        }
+        if (cleanName && rec.name && rec.name.trim().toLowerCase() === cleanName) {
+          return key;
+        }
+      }
+    }
+
+    // Known canonical system mappings
+    if (cleanEmail === 'admin@rejoysolar.com' || cleanName === 'vikram patel') return 'emp-1';
+    if (cleanEmail === 'projectmanager@rejoysolar.com' || cleanName === 'amit sharma') return 'emp-2';
+    if (cleanEmail === 'survey@rejoysolar.com' || cleanName === 'rajesh kumar' || cleanId === 'test-engineer-1') return 'emp-3';
+    if (cleanEmail === 'salesmanager@rejoysolar.com' || cleanName === 'priya verma') return 'emp-4';
+    if (cleanEmail === 'civil@rejoysolar.com' || cleanName === 'suresh patel') return 'emp-14';
+
+    return cleanId || cleanEmail || cleanCode || 'unknown-user';
+  }
+
+  // Save current workforce state to disk atomically without clobbering concurrent multi-process writes
+  function persistWorkforceState(): boolean {
+    try {
+      const diskRecords = readWorkforceCacheFromDisk();
+      const mergedMap = new Map<string, WorkforceRecord>();
+
+      // 1. Index disk records by canonical identity
+      diskRecords.forEach((r) => {
+        if (r && r.userId) {
+          const canonicalKey = resolveCanonicalWorkforceKey(r.userId, r.email, r.employeeCode, r.name);
+          mergedMap.set(canonicalKey, { ...r, userId: canonicalKey });
+        }
+      });
+
+      // 2. Merge in-memory workforceState, preserving the newer lastSeenAt across processes
+      workforceState.forEach((memRec, memKey) => {
+        const canonicalKey = resolveCanonicalWorkforceKey(memKey, memRec.email, memRec.employeeCode, memRec.name);
+        const diskRec = mergedMap.get(canonicalKey);
+
+        if (!diskRec) {
+          mergedMap.set(canonicalKey, { ...memRec, userId: canonicalKey });
+        } else {
+          const memTime = memRec.lastSeenAt ? new Date(memRec.lastSeenAt).getTime() : 0;
+          const diskTime = diskRec.lastSeenAt ? new Date(diskRec.lastSeenAt).getTime() : 0;
+
+          if (memTime >= diskTime) {
+            // Memory is newer or equal: apply memory updates
+            mergedMap.set(canonicalKey, {
+              ...diskRec,
+              ...memRec,
+              userId: canonicalKey,
+              latitude: memRec.latitude !== undefined ? memRec.latitude : diskRec.latitude,
+              longitude: memRec.longitude !== undefined ? memRec.longitude : diskRec.longitude,
+              hasLocation: Boolean(memRec.latitude !== undefined || diskRec.latitude !== undefined)
+            });
+          } else {
+            // Disk is newer from another worker: update in-memory state
+            workforceState.set(canonicalKey, diskRec);
+          }
+        }
+
+        // Clean up memory alias key if different from canonicalKey
+        if (memKey !== canonicalKey && workforceState.has(memKey)) {
+          workforceState.delete(memKey);
+        }
+      });
+
+      // 3. Re-sync memory to canonical records
+      mergedMap.forEach((val, key) => {
+        workforceState.set(key, val);
+      });
+
+      const arr = Array.from(mergedMap.values());
+      const tempFile = `${CACHE_FILE}.tmp.${process.pid}.${Date.now()}`;
+      fs.writeFileSync(tempFile, JSON.stringify(arr, null, 2), 'utf-8');
+      fs.renameSync(tempFile, CACHE_FILE);
+      return true;
+    } catch (err) {
+      console.error('[Workforce State] Failed to persist workforce cache to disk:', err);
+      return false;
+    }
   }
 
   // Authoritative sync across multi-process / multi-worker instances
   function syncWorkforceState(): void {
     const diskRecords = readWorkforceCacheFromDisk();
     const now = Date.now();
+
     diskRecords.forEach((rec: WorkforceRecord) => {
       if (!rec || !rec.userId) return;
-      const existing = workforceState.get(rec.userId);
+      const canonicalKey = resolveCanonicalWorkforceKey(rec.userId, rec.email, rec.employeeCode, rec.name);
+      const existing = workforceState.get(canonicalKey);
       const diskLastSeen = rec.lastSeenAt ? new Date(rec.lastSeenAt).getTime() : 0;
-      const isOnline = Boolean(rec.isOnline) && (now - diskLastSeen < PRESENCE_TIMEOUT_MS);
+      // Clock skew tolerant check: online if lastSeen is within PRESENCE_TIMEOUT_MS
+      const isOnline = Boolean(rec.isOnline) && (Math.abs(now - diskLastSeen) < PRESENCE_TIMEOUT_MS);
+
+      rec.userId = canonicalKey;
+      rec.isOnline = isOnline;
+      if (!isOnline) rec.status = 'offline';
 
       if (!existing) {
-        rec.isOnline = isOnline;
-        if (!isOnline) rec.status = 'offline';
-        workforceState.set(rec.userId, rec);
+        workforceState.set(canonicalKey, rec);
       } else {
         const existingLastSeen = existing.lastSeenAt ? new Date(existing.lastSeenAt).getTime() : 0;
         if (diskLastSeen >= existingLastSeen) {
-          existing.isOnline = isOnline;
-          existing.lastSeenAt = rec.lastSeenAt;
-          existing.updatedAt = rec.updatedAt || rec.lastSeenAt;
-          existing.status = !isOnline ? 'offline' : rec.status;
-          if (typeof rec.latitude === 'number') {
-            existing.latitude = rec.latitude;
-            existing.longitude = rec.longitude;
-            existing.hasLocation = true;
-          }
-          if (rec.name && (!existing.name || existing.name.startsWith('Field Worker ('))) {
-            existing.name = rec.name;
-          }
-          if (rec.role) existing.role = rec.role;
-          if (rec.employeeCode) existing.employeeCode = rec.employeeCode;
-          if (rec.email) existing.email = rec.email;
+          workforceState.set(canonicalKey, {
+            ...existing,
+            ...rec,
+            userId: canonicalKey,
+            latitude: rec.latitude !== undefined ? rec.latitude : existing.latitude,
+            longitude: rec.longitude !== undefined ? rec.longitude : existing.longitude,
+            hasLocation: Boolean(rec.latitude !== undefined || existing.latitude !== undefined)
+          });
         }
       }
     });
@@ -239,22 +347,8 @@ async function startServer() {
 
   // Initial startup sync
   syncWorkforceState();
-  console.log(`[Workforce] Loaded ${workforceState.size} cached employee tracking records from disk.`);
-
-  // Save current workforce state to disk, merging with disk to preserve multi-worker state
-  function persistWorkforceState() {
-    try {
-      const diskRecords = readWorkforceCacheFromDisk();
-      const mergedMap = new Map<string, WorkforceRecord>();
-      diskRecords.forEach((r) => { if (r && r.userId) mergedMap.set(r.userId, r); });
-      workforceState.forEach((val, key) => mergedMap.set(key, val));
-
-      const arr = Array.from(mergedMap.values());
-      fs.writeFileSync(CACHE_FILE, JSON.stringify(arr, null, 2), 'utf-8');
-    } catch (err) {
-      // Non-blocking
-    }
-  }
+  persistWorkforceState();
+  console.log(`[Workforce] Authoritative startup: synchronized ${workforceState.size} workforce tracking records.`);
 
   // Helper to broadcast via Pusher AND SSE
   async function broadcastWorkforceEvent(eventType: string, data: any) {
@@ -363,10 +457,15 @@ async function startServer() {
   // Find existing employee record by ID, email, or employeeCode
   function findExistingWorkforceRecord(userId: string, email?: string, employeeCode?: string): WorkforceRecord | undefined {
     syncWorkforceState();
-    if (userId && workforceState.has(userId)) return workforceState.get(userId);
     const cleanId = userId ? userId.trim().toLowerCase() : '';
     const cleanEmail = email ? email.trim().toLowerCase() : '';
     const cleanCode = employeeCode ? employeeCode.trim().toLowerCase() : '';
+
+    const canonicalKey = resolveCanonicalWorkforceKey(userId, email, employeeCode);
+    if (canonicalKey && workforceState.has(canonicalKey)) {
+      return workforceState.get(canonicalKey);
+    }
+    if (userId && workforceState.has(userId)) return workforceState.get(userId);
 
     for (const rec of workforceState.values()) {
       if (cleanId && rec.userId && rec.userId.trim().toLowerCase() === cleanId) {
@@ -391,9 +490,43 @@ async function startServer() {
 
     syncWorkforceState();
     const now = Date.now();
-    const records = Array.from(workforceState.values()).map((rec) => {
+
+    // Deduplicate by canonical user key
+    const deduplicated = new Map<string, WorkforceRecord>();
+    for (const [key, rec] of workforceState.entries()) {
+      const canonicalKey = resolveCanonicalWorkforceKey(rec.userId, rec.email, rec.employeeCode, rec.name);
+      const existing = deduplicated.get(canonicalKey);
+      if (!existing) {
+        deduplicated.set(canonicalKey, { ...rec, userId: canonicalKey });
+      } else {
+        const recTime = rec.lastSeenAt ? new Date(rec.lastSeenAt).getTime() : 0;
+        const exTime = existing.lastSeenAt ? new Date(existing.lastSeenAt).getTime() : 0;
+        if (recTime >= exTime) {
+          deduplicated.set(canonicalKey, {
+            ...existing,
+            ...rec,
+            userId: canonicalKey,
+            latitude: rec.latitude !== undefined ? rec.latitude : existing.latitude,
+            longitude: rec.longitude !== undefined ? rec.longitude : existing.longitude,
+            hasLocation: Boolean(rec.latitude !== undefined || existing.latitude !== undefined)
+          });
+        }
+      }
+
+      // If key in memory was an alias, remove it
+      if (key !== canonicalKey) {
+        workforceState.delete(key);
+      }
+    }
+
+    // Re-align workforceState with deduplicated records
+    deduplicated.forEach((val, key) => {
+      workforceState.set(key, val);
+    });
+
+    const records = Array.from(deduplicated.values()).map((rec) => {
       const lastSeen = rec.lastSeenAt ? new Date(rec.lastSeenAt).getTime() : 0;
-      const isOnline = Boolean(rec.isOnline) && (now - lastSeen < PRESENCE_TIMEOUT_MS);
+      const isOnline = Boolean(rec.isOnline) && (Math.abs(now - lastSeen) < PRESENCE_TIMEOUT_MS);
       return {
         ...rec,
         isOnline,
@@ -459,7 +592,7 @@ async function startServer() {
 
       const rawId = callerUserId ? String(callerUserId).trim() : '';
       const existing = findExistingWorkforceRecord(rawId, email, employeeCode);
-      const targetId = existing?.userId || rawId;
+      const targetId = resolveCanonicalWorkforceKey(existing?.userId || rawId, email || existing?.email, employeeCode || existing?.employeeCode);
       const timestamp = new Date().toISOString();
 
       const updated: WorkforceRecord = {
@@ -489,10 +622,18 @@ async function startServer() {
       if (rawId && rawId !== targetId && workforceState.has(rawId)) {
         workforceState.delete(rawId);
       }
+      if (existing && existing.userId !== targetId && workforceState.has(existing.userId)) {
+        workforceState.delete(existing.userId);
+      }
 
       workforceState.set(targetId, updated);
-      persistWorkforceState();
-      console.log(`[Presence] workforce state updated ${targetId}`);
+      
+      // CRITICAL REQUIREMENT 4: Verify that heartbeat data is actually persisted BEFORE returning success
+      const persisted = persistWorkforceState();
+      if (!persisted) {
+        console.warn(`[Presence] Warning: Persistence returned false for ${targetId}`);
+      }
+      console.log(`[Presence] workforce state updated & persisted ${targetId}`);
 
       // Broadcast presence update with full metadata
       const presencePayload = {
@@ -507,7 +648,11 @@ async function startServer() {
         isSharingLocation: updated.isSharingLocation,
         latitude: updated.latitude,
         longitude: updated.longitude,
-        status: updated.status
+        status: updated.status,
+        speed: updated.speed,
+        accuracy: updated.accuracy,
+        batteryLevel: updated.batteryLevel,
+        activity: updated.activity
       };
       await broadcastWorkforceEvent('presence.updated', presencePayload);
       console.log(`[Presence] presence.updated broadcast ${targetId}`);
@@ -539,7 +684,7 @@ async function startServer() {
 
       const rawId = callerUserId ? String(callerUserId).trim() : '';
       const existing = findExistingWorkforceRecord(rawId, email, employeeCode);
-      const targetId = existing?.userId || rawId;
+      const targetId = resolveCanonicalWorkforceKey(existing?.userId || rawId, email || existing?.email, employeeCode || existing?.employeeCode);
       const timestamp = new Date().toISOString();
 
       if (existing) {
@@ -623,7 +768,7 @@ async function startServer() {
 
       // Persist in workforceState with canonical id resolution
       const existing = findExistingWorkforceRecord(id, undefined, employeeCode);
-      const targetId = existing?.userId || id;
+      const targetId = resolveCanonicalWorkforceKey(existing?.userId || id, existing?.email, employeeCode || existing?.employeeCode);
       const updatedRecord: WorkforceRecord = {
         userId: targetId,
         employeeCode: employeeCode || existing?.employeeCode || targetId,

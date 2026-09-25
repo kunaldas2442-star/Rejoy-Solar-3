@@ -522,7 +522,7 @@ export const LiveFieldMap: React.FC<LiveFieldMapProps> = ({
       <div className="absolute bottom-3 left-3 z-[400] flex items-center gap-2 text-[11px] font-medium text-slate-600 bg-white/90 backdrop-blur-sm px-3 py-1.5 rounded-xl border border-slate-200 shadow-sm">
         <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
         <span className="font-bold text-slate-800">
-          {locations.filter((l) => l.hasLocation && (l.status === 'moving' || l.status === 'online')).length} active on map
+          {locations.filter((l) => l.isOnline && l.hasLocation && typeof l.latitude === 'number' && typeof l.longitude === 'number').length} active on map
         </span>
         <span className="text-slate-300">|</span>
         <span className="text-slate-500">Leaflet & OpenStreetMap (Free, No API Key)</span>

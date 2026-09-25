@@ -412,7 +412,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     }
 
-    const isBootstrappedAdmin = cleanUserEmail === 'dasest404@gmail.com';
+    const isBootstrappedAdmin = cleanUserEmail === 'dasest404@gmail.com' || cleanUserEmail === 'kunaldas2442@gmail.com';
     const defaultRole: UserRole = isBootstrappedAdmin
       ? 'Admin'
       : linkedEmp?.systemRole || linkedEmp?.assignedRole || demoAccount?.role || 'Admin';

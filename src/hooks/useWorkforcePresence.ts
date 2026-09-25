@@ -25,18 +25,26 @@ export function useWorkforcePresence(currentUser: UserProfile | null, isAuthenti
     const role = currentUser.role;
 
     const triggerHeartbeat = async () => {
+      const user = currentUserRef.current;
+      if (!user) return;
+      const activeUserId = user.id;
+      const activeCode = user.employeeId || user.id;
+      const activeName = user.name;
+      const activeEmail = user.email;
+      const activeRole = user.role;
+
       try {
-        console.log('[Presence] heartbeat sent', { userId });
+        console.log('[Presence] heartbeat sent', { userId: activeUserId });
         const success = await liveLocationService.sendHeartbeat({
-          userId,
-          employeeCode,
-          name,
-          email,
-          role,
+          userId: activeUserId,
+          employeeCode: activeCode,
+          name: activeName,
+          email: activeEmail,
+          role: activeRole,
           isSharingLocation: liveLocationService.isLocationSharingActive()
         });
         if (success) {
-          console.log('[Presence] heartbeat response 200', { userId });
+          console.log('[Presence] heartbeat response 200', { userId: activeUserId });
         }
       } catch (err) {
         console.warn('[Workforce Presence] Automatic heartbeat failed:', err);

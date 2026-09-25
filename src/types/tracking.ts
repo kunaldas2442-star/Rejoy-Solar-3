@@ -15,8 +15,8 @@ export type PusherConnectionState =
   | RealtimeTransportState;
 
 // Centralized timing constants for presence & heartbeat
-export const PRESENCE_TIMEOUT_MS = 60 * 1000; // 60 seconds without heartbeat marks worker offline
-export const HEARTBEAT_INTERVAL_MS = 25 * 1000; // 25 seconds heartbeat interval
+export const PRESENCE_TIMEOUT_MS = 120 * 1000; // 120 seconds timeout with clock skew tolerance
+export const HEARTBEAT_INTERVAL_MS = 20 * 1000; // 20 seconds heartbeat interval
 
 export interface LocationCoordinates {
   latitude: number;
@@ -25,6 +25,9 @@ export interface LocationCoordinates {
 
 export interface LocationUpdatePayload {
   userId: string;
+  employeeCode?: string;
+  name?: string;
+  role?: string;
   latitude: number;
   longitude: number;
   accuracy?: number; // in meters
