@@ -25,7 +25,7 @@ service cloud.firestore {
 
     // Bootstrapped Admin: user email dasest404@gmail.com or registered in admin collection or role == 'Admin' in users
     function isSuperAdmin() {
-      return isSignedIn() && request.auth.token.email == 'dasest404@gmail.com';
+      return isSignedIn() && (request.auth.token.email == 'dasest404@gmail.com' || request.auth.token.email == 'kunaldas2442@gmail.com');
     }
 
     function isAdmin() {

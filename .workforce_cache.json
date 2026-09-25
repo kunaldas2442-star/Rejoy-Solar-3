@@ -9,8 +9,8 @@
     "longitude": 72.385,
     "speed": 25,
     "activity": "Approaching project site",
-    "updatedAt": "2026-09-24T13:54:10.106Z",
-    "lastSeenAt": "2026-09-25T13:02:38.271Z",
+    "updatedAt": "2026-09-25T14:20:55.919Z",
+    "lastSeenAt": "2026-09-25T14:21:41.188Z",
     "isOnline": false,
     "isSharingLocation": false,
     "hasLocation": true,
@@ -47,10 +47,10 @@
     "role": "Admin",
     "updatedAt": "2026-09-25T09:02:05.460Z",
     "lastSeenAt": "2026-09-25T13:02:25.923Z",
-    "isOnline": true,
+    "isOnline": false,
     "isSharingLocation": false,
     "hasLocation": false,
-    "status": "online"
+    "status": "offline"
   },
   {
     "userId": "test-engineer-1",
@@ -85,5 +85,31 @@
     "isSharingLocation": false,
     "hasLocation": true,
     "status": "offline"
+  },
+  {
+    "userId": "emp-1",
+    "employeeCode": "EMP001",
+    "name": "Vikram Patel",
+    "email": "admin@rejoysolar.com",
+    "role": "Admin",
+    "updatedAt": "2026-09-25T14:21:31.702Z",
+    "lastSeenAt": "2026-09-25T14:21:31.702Z",
+    "isOnline": true,
+    "isSharingLocation": false,
+    "hasLocation": false,
+    "status": "online"
+  },
+  {
+    "userId": "emp-new-surveyor",
+    "employeeCode": "EMP999",
+    "name": "Pooja Sharma",
+    "email": "pooja@rejoysolar.com",
+    "role": "Site Survey Engineer",
+    "updatedAt": "2026-09-25T14:21:18.347Z",
+    "lastSeenAt": "2026-09-25T14:21:18.347Z",
+    "isOnline": true,
+    "isSharingLocation": false,
+    "hasLocation": false,
+    "status": "online"
   }
 ]

@@ -492,39 +492,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [isFirebaseReady]);
 
-  // Automatic Presence Heartbeat for authenticated team members (every 25 seconds)
-  useEffect(() => {
-    if (!currentUser || currentUser.role === 'Customer') return;
-
-    // Send immediate initial presence heartbeat
-    liveLocationService.sendHeartbeat({
-      userId: currentUser.id,
-      employeeCode: currentUser.employeeId,
-      name: currentUser.name,
-      role: currentUser.role,
-      isSharingLocation: false
-    });
-
-    const timer = setInterval(() => {
-      liveLocationService.sendHeartbeat({
-        userId: currentUser.id,
-        employeeCode: currentUser.employeeId,
-        name: currentUser.name,
-        role: currentUser.role,
-        isSharingLocation: false
-      });
-    }, 25000);
-
-    const handleBeforeUnload = () => {
-      liveLocationService.sendOffline(currentUser.id);
-    };
-    window.addEventListener('beforeunload', handleBeforeUnload);
-
-    return () => {
-      clearInterval(timer);
-      window.removeEventListener('beforeunload', handleBeforeUnload);
-    };
-  }, [currentUser?.id, currentUser?.role]);
+  // Active presence heartbeat is authoritatively managed by useWorkforcePresence hook in App.tsx
+  // to guarantee a single lifecycle per logged-in browser without competing intervals or premature unmount cleanups.
 
   // Persist active user profile changes
   const saveUserProfile = (profile: UserProfile) => {

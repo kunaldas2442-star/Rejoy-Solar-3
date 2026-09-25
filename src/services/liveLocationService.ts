@@ -135,35 +135,60 @@ class LiveLocationService {
   /**
    * Resolves any user identifier (emp-id, email, code, auth uid) to canonical employee ID
    */
-  public resolveCanonicalId(rawId: string, email?: string, employeeCode?: string): string {
-    if (!rawId && !email && !employeeCode) return rawId || '';
-    if (rawId && this.employeeLocations.has(rawId)) return rawId;
-
+  public resolveCanonicalId(rawId: string, email?: string, employeeCode?: string, alternateUserId?: string): string {
     const cleanId = rawId ? rawId.trim().toLowerCase() : '';
-    if (cleanId && this.alternateIdMap.has(cleanId)) {
-      return this.alternateIdMap.get(cleanId)!;
-    }
-
+    const cleanAlt = alternateUserId ? alternateUserId.trim().toLowerCase() : '';
     const cleanEmail = email ? email.trim().toLowerCase() : '';
-    if (cleanEmail && this.alternateIdMap.has(cleanEmail)) {
-      return this.alternateIdMap.get(cleanEmail)!;
-    }
-
     const cleanCode = employeeCode ? employeeCode.trim().toLowerCase() : '';
-    if (cleanCode && this.alternateIdMap.has(cleanCode)) {
-      return this.alternateIdMap.get(cleanCode)!;
-    }
 
-    // Try finding matching employee in memory
+    if (!cleanId && !cleanEmail && !cleanCode && !cleanAlt) return rawId || '';
+
+    // Direct match in active memory
+    if (rawId && this.employeeLocations.has(rawId)) return rawId;
+    if (alternateUserId && this.employeeLocations.has(alternateUserId)) return alternateUserId;
+
+    // Check alias maps
+    if (cleanId && this.alternateIdMap.has(cleanId)) return this.alternateIdMap.get(cleanId)!;
+    if (cleanAlt && this.alternateIdMap.has(cleanAlt)) return this.alternateIdMap.get(cleanAlt)!;
+    if (cleanEmail && this.alternateIdMap.has(cleanEmail)) return this.alternateIdMap.get(cleanEmail)!;
+    if (cleanCode && this.alternateIdMap.has(cleanCode)) return this.alternateIdMap.get(cleanCode)!;
+
+    // Search active locations in memory by email or employeeCode
     for (const [id, emp] of this.employeeLocations.entries()) {
       if (cleanEmail && emp.email && emp.email.trim().toLowerCase() === cleanEmail) {
         if (cleanId) this.alternateIdMap.set(cleanId, id);
+        if (cleanAlt) this.alternateIdMap.set(cleanAlt, id);
         return id;
       }
       if (cleanCode && emp.employeeCode && emp.employeeCode.trim().toLowerCase() === cleanCode) {
         if (cleanId) this.alternateIdMap.set(cleanId, id);
+        if (cleanAlt) this.alternateIdMap.set(cleanAlt, id);
         return id;
       }
+    }
+
+    // Search storageService employees for canonical mapping
+    try {
+      const allEmployees = storageService.getEmployees();
+      for (const emp of allEmployees) {
+        const empId = emp.id;
+        const matchEmail = cleanEmail && emp.email && emp.email.trim().toLowerCase() === cleanEmail;
+        const matchCode = cleanCode && emp.employeeCode && emp.employeeCode.trim().toLowerCase() === cleanCode;
+        const matchAuth = (cleanId && emp.authUid && emp.authUid.trim().toLowerCase() === cleanId) ||
+                          (cleanAlt && emp.authUid && emp.authUid.trim().toLowerCase() === cleanAlt);
+        const matchId = (cleanId && emp.id && emp.id.trim().toLowerCase() === cleanId) ||
+                        (cleanAlt && emp.id && emp.id.trim().toLowerCase() === cleanAlt);
+
+        if (matchEmail || matchCode || matchAuth || matchId) {
+          if (cleanId) this.alternateIdMap.set(cleanId, empId);
+          if (cleanAlt) this.alternateIdMap.set(cleanAlt, empId);
+          if (cleanEmail) this.alternateIdMap.set(cleanEmail, empId);
+          if (cleanCode) this.alternateIdMap.set(cleanCode, empId);
+          return empId;
+        }
+      }
+    } catch {
+      // Non-blocking
     }
 
     return rawId;
@@ -302,47 +327,62 @@ class LiveLocationService {
         const isOnline = Boolean(srv.isOnline) && (now - lastSeenMs < PRESENCE_TIMEOUT_MS);
 
         if (existing) {
-          // Avoid race condition: do not overwrite if local state has a strictly newer update
-          const localUpdated = new Date(existing.updatedAt).getTime();
-          const serverUpdated = new Date(srv.updatedAt || srv.lastSeenAt || 0).getTime();
-
-          if (serverUpdated >= localUpdated || !existing.hasLocation) {
+          // Always apply server presence state and lastSeenAt
+          if (srv.lastSeenAt) {
+            existing.lastSeenAt = srv.lastSeenAt;
             existing.isOnline = isOnline;
-            existing.isSharingLocation = srv.isSharingLocation ?? existing.isSharingLocation;
-            existing.lastSeenAt = srv.lastSeenAt || existing.lastSeenAt;
-
-            if (hasCoords) {
-              existing.latitude = srv.latitude;
-              existing.longitude = srv.longitude;
-              existing.hasLocation = true;
-              existing.accuracy = srv.accuracy;
-              existing.heading = srv.heading;
-              existing.speed = srv.speed;
-              existing.batteryLevel = srv.batteryLevel ?? existing.batteryLevel;
-              existing.currentActivity = srv.activity || existing.currentActivity;
-              existing.updatedAt = srv.updatedAt || existing.updatedAt;
-
-              if (existing.assignedSiteCoordinates) {
-                existing.distanceToSiteKm = calculateDistanceKm(
-                  srv.latitude,
-                  srv.longitude,
-                  existing.assignedSiteCoordinates.latitude,
-                  existing.assignedSiteCoordinates.longitude
-                );
-              }
-            }
-
-            existing.status = !isOnline
-              ? 'offline'
-              : existing.hasLocation
-              ? ((existing.speed || 0) > 3 ? 'moving' : 'idle')
-              : 'online';
           }
+          if (typeof srv.isSharingLocation === 'boolean') {
+            existing.isSharingLocation = srv.isSharingLocation;
+          }
+          if (srv.name && (!existing.name || existing.name.startsWith('Field Worker ('))) {
+            existing.name = srv.name;
+          }
+          if (srv.role) existing.role = srv.role;
+          if (srv.employeeCode && (!existing.employeeCode || existing.employeeCode === existing.userId)) {
+            existing.employeeCode = srv.employeeCode;
+          }
+          if (srv.email && !existing.email) existing.email = srv.email;
+
+          if (hasCoords) {
+            existing.latitude = srv.latitude;
+            existing.longitude = srv.longitude;
+            existing.hasLocation = true;
+            existing.accuracy = srv.accuracy;
+            existing.heading = srv.heading;
+            existing.speed = srv.speed;
+            existing.batteryLevel = srv.batteryLevel ?? existing.batteryLevel;
+            existing.currentActivity = srv.activity || existing.currentActivity;
+            existing.updatedAt = srv.updatedAt || srv.lastSeenAt || existing.updatedAt;
+
+            if (existing.assignedSiteCoordinates) {
+              existing.distanceToSiteKm = calculateDistanceKm(
+                srv.latitude,
+                srv.longitude,
+                existing.assignedSiteCoordinates.latitude,
+                existing.assignedSiteCoordinates.longitude
+              );
+            }
+          }
+
+          existing.status = !isOnline
+            ? 'offline'
+            : existing.hasLocation
+            ? ((existing.speed || 0) > 3 ? 'moving' : 'idle')
+            : 'online';
+
+          if (!existing.hasLocation && isOnline) {
+            existing.currentActivity = existing.isSharingLocation
+              ? 'Online • Awaiting GPS fix'
+              : 'Online • Standby';
+          }
+
+          this.employeeLocations.set(targetId, { ...existing });
         } else {
           // Add newly discovered field worker from server
           const newRecord: LiveEmployeeLocation = {
             userId: targetId,
-            employeeCode: srv.employeeCode,
+            employeeCode: srv.employeeCode || targetId,
             name: srv.name || `Field Worker (${targetId.slice(0, 6)})`,
             email: srv.email,
             role: srv.role || 'Field Engineer',
@@ -358,8 +398,8 @@ class LiveLocationService {
             heading: srv.heading,
             speed: srv.speed,
             batteryLevel: srv.batteryLevel,
-            currentActivity: srv.activity || (isOnline ? 'Online • Location Standby' : 'Offline'),
-            updatedAt: srv.updatedAt || new Date().toISOString(),
+            currentActivity: srv.activity || (isOnline ? (hasCoords ? 'Active' : 'Online • Standby') : 'Offline'),
+            updatedAt: srv.updatedAt || srv.lastSeenAt || new Date().toISOString(),
             status: !isOnline ? 'offline' : hasCoords ? ((srv.speed || 0) > 3 ? 'moving' : 'idle') : 'online'
           };
           this.employeeLocations.set(targetId, newRecord);
@@ -367,6 +407,8 @@ class LiveLocationService {
           if (srv.userId && srv.userId !== targetId) {
             this.alternateIdMap.set(srv.userId.toLowerCase(), targetId);
           }
+          if (srv.email) this.alternateIdMap.set(srv.email.toLowerCase(), targetId);
+          if (srv.employeeCode) this.alternateIdMap.set(srv.employeeCode.toLowerCase(), targetId);
         }
       });
 
@@ -456,7 +498,14 @@ class LiveLocationService {
   private handleIncomingPresence(payload: PresenceUpdatePayload) {
     if (!payload || !payload.userId) return;
 
-    const canonicalId = this.resolveCanonicalId(payload.userId, payload.email, payload.employeeCode);
+    console.log(`[Presence] presence.updated received ${payload.userId}`);
+
+    const canonicalId = this.resolveCanonicalId(
+      payload.userId,
+      payload.email,
+      payload.employeeCode,
+      payload.alternateUserId
+    );
     const existing = this.employeeLocations.get(canonicalId);
     const isOnline = Boolean(payload.isOnline);
     const timestamp = payload.lastSeenAt || new Date().toISOString();
@@ -464,34 +513,41 @@ class LiveLocationService {
     if (existing) {
       existing.isOnline = isOnline;
       existing.lastSeenAt = timestamp;
+      existing.updatedAt = timestamp;
       if (typeof payload.isSharingLocation === 'boolean') {
         existing.isSharingLocation = payload.isSharingLocation;
       }
-      if (payload.role && !existing.role) existing.role = payload.role;
-      if (payload.employeeCode && !existing.employeeCode) existing.employeeCode = payload.employeeCode;
+      if (payload.role) existing.role = payload.role;
+      if (payload.employeeCode && (!existing.employeeCode || existing.employeeCode === existing.userId)) {
+        existing.employeeCode = payload.employeeCode;
+      }
       if (payload.name && (!existing.name || existing.name.startsWith('Field Worker ('))) {
         existing.name = payload.name;
       }
+      if (payload.email && !existing.email) existing.email = payload.email;
 
       // Determine status independently from GPS
       if (!isOnline) {
         existing.status = 'offline';
         existing.currentActivity = 'Offline';
-      } else if (existing.hasLocation) {
+      } else if (existing.hasLocation && typeof existing.latitude === 'number' && typeof existing.longitude === 'number') {
         existing.status = (existing.speed && existing.speed > 3) ? 'moving' : 'idle';
+        existing.currentActivity = (existing.speed && existing.speed > 3) ? 'In Transit / Moving' : 'On Site / Active';
       } else {
         existing.status = 'online';
         existing.currentActivity = existing.isSharingLocation
           ? 'Online • Awaiting GPS fix'
-          : 'Online • Location Standby';
+          : 'Online • Standby';
       }
+
+      this.employeeLocations.set(canonicalId, { ...existing });
       this.persistRealLocation(canonicalId, existing);
     } else {
       // Dynamic worker entry if receiving presence for a worker not yet in local state
       const hasCoords = typeof payload.latitude === 'number' && typeof payload.longitude === 'number';
       const newRecord: LiveEmployeeLocation = {
         userId: canonicalId,
-        employeeCode: payload.employeeCode,
+        employeeCode: payload.employeeCode || canonicalId,
         name: payload.name || `Field Worker (${canonicalId.slice(0, 6)})`,
         email: payload.email,
         role: payload.role || 'Field Engineer',
@@ -507,15 +563,21 @@ class LiveLocationService {
         accuracy: payload.accuracy,
         speed: payload.speed,
         status: !isOnline ? 'offline' : hasCoords ? ((payload.speed || 0) > 3 ? 'moving' : 'idle') : 'online',
-        currentActivity: isOnline ? (hasCoords ? 'Active' : 'Online • Location Standby') : 'Offline'
+        currentActivity: isOnline ? (hasCoords ? 'Active' : 'Online • Standby') : 'Offline'
       };
       this.employeeLocations.set(canonicalId, newRecord);
       this.alternateIdMap.set(canonicalId.toLowerCase(), canonicalId);
-      if (payload.userId !== canonicalId) {
+      if (payload.userId && payload.userId !== canonicalId) {
         this.alternateIdMap.set(payload.userId.toLowerCase(), canonicalId);
       }
       if (payload.alternateUserId) {
         this.alternateIdMap.set(payload.alternateUserId.toLowerCase(), canonicalId);
+      }
+      if (payload.email) {
+        this.alternateIdMap.set(payload.email.toLowerCase(), canonicalId);
+      }
+      if (payload.employeeCode) {
+        this.alternateIdMap.set(payload.employeeCode.toLowerCase(), canonicalId);
       }
       this.persistRealLocation(canonicalId, newRecord);
     }
@@ -646,6 +708,8 @@ class LiveLocationService {
 
   private notifyListeners() {
     const list = this.getLocations();
+    const onlineCount = list.filter((l) => l.isOnline).length;
+    console.log(`[Presence] online employees: ${onlineCount}`);
     this.listeners.forEach((listener) => {
       try {
         listener(list);

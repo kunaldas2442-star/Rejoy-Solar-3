@@ -26,7 +26,8 @@ export function useWorkforcePresence(currentUser: UserProfile | null, isAuthenti
 
     const triggerHeartbeat = async () => {
       try {
-        await liveLocationService.sendHeartbeat({
+        console.log('[Presence] heartbeat sent', { userId });
+        const success = await liveLocationService.sendHeartbeat({
           userId,
           employeeCode,
           name,
@@ -34,6 +35,9 @@ export function useWorkforcePresence(currentUser: UserProfile | null, isAuthenti
           role,
           isSharingLocation: liveLocationService.isLocationSharingActive()
         });
+        if (success) {
+          console.log('[Presence] heartbeat response 200', { userId });
+        }
       } catch (err) {
         console.warn('[Workforce Presence] Automatic heartbeat failed:', err);
       }
@@ -57,8 +61,8 @@ export function useWorkforcePresence(currentUser: UserProfile | null, isAuthenti
       clearInterval(intervalTimer);
       window.removeEventListener('beforeunload', handleUnload);
       window.removeEventListener('pagehide', handleUnload);
-      // Notify server offline on user session change / component unmount
-      liveLocationService.sendOffline(userId, email, employeeCode).catch(() => {});
+      // NOTE: Do NOT send offline in React effect cleanup, as component re-renders or navigation
+      // must not prematurely knock the user offline. Explicit offline is handled by logout or beforeunload.
     };
   }, [isAuthenticated, currentUser?.id, currentUser?.role]);
 }

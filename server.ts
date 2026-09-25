@@ -186,33 +186,70 @@ async function startServer() {
   const sseClients = new Set<express.Response>();
   const CACHE_FILE = path.join(process.cwd(), '.workforce_cache.json');
 
-  // Load persisted workforce state from disk on startup
-  try {
-    if (fs.existsSync(CACHE_FILE)) {
-      const raw = fs.readFileSync(CACHE_FILE, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        parsed.forEach((rec: WorkforceRecord) => {
-          if (rec && rec.userId) {
-            // Check stale on load
-            const lastSeen = rec.lastSeenAt ? new Date(rec.lastSeenAt).getTime() : 0;
-            const isOnline = Date.now() - lastSeen < PRESENCE_TIMEOUT_MS;
-            rec.isOnline = isOnline;
-            if (!isOnline) rec.status = 'offline';
-            workforceState.set(rec.userId, rec);
-          }
-        });
-        console.log(`[Workforce] Loaded ${workforceState.size} cached employee tracking records from disk.`);
+  // Read persisted workforce records from disk
+  function readWorkforceCacheFromDisk(): WorkforceRecord[] {
+    try {
+      if (fs.existsSync(CACHE_FILE)) {
+        const raw = fs.readFileSync(CACHE_FILE, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) return parsed;
       }
+    } catch (err) {
+      // Non-blocking
     }
-  } catch (err) {
-    console.warn('[Workforce] Could not read cache file:', err);
+    return [];
   }
 
-  // Save current workforce state to disk
+  // Authoritative sync across multi-process / multi-worker instances
+  function syncWorkforceState(): void {
+    const diskRecords = readWorkforceCacheFromDisk();
+    const now = Date.now();
+    diskRecords.forEach((rec: WorkforceRecord) => {
+      if (!rec || !rec.userId) return;
+      const existing = workforceState.get(rec.userId);
+      const diskLastSeen = rec.lastSeenAt ? new Date(rec.lastSeenAt).getTime() : 0;
+      const isOnline = Boolean(rec.isOnline) && (now - diskLastSeen < PRESENCE_TIMEOUT_MS);
+
+      if (!existing) {
+        rec.isOnline = isOnline;
+        if (!isOnline) rec.status = 'offline';
+        workforceState.set(rec.userId, rec);
+      } else {
+        const existingLastSeen = existing.lastSeenAt ? new Date(existing.lastSeenAt).getTime() : 0;
+        if (diskLastSeen >= existingLastSeen) {
+          existing.isOnline = isOnline;
+          existing.lastSeenAt = rec.lastSeenAt;
+          existing.updatedAt = rec.updatedAt || rec.lastSeenAt;
+          existing.status = !isOnline ? 'offline' : rec.status;
+          if (typeof rec.latitude === 'number') {
+            existing.latitude = rec.latitude;
+            existing.longitude = rec.longitude;
+            existing.hasLocation = true;
+          }
+          if (rec.name && (!existing.name || existing.name.startsWith('Field Worker ('))) {
+            existing.name = rec.name;
+          }
+          if (rec.role) existing.role = rec.role;
+          if (rec.employeeCode) existing.employeeCode = rec.employeeCode;
+          if (rec.email) existing.email = rec.email;
+        }
+      }
+    });
+  }
+
+  // Initial startup sync
+  syncWorkforceState();
+  console.log(`[Workforce] Loaded ${workforceState.size} cached employee tracking records from disk.`);
+
+  // Save current workforce state to disk, merging with disk to preserve multi-worker state
   function persistWorkforceState() {
     try {
-      const arr = Array.from(workforceState.values());
+      const diskRecords = readWorkforceCacheFromDisk();
+      const mergedMap = new Map<string, WorkforceRecord>();
+      diskRecords.forEach((r) => { if (r && r.userId) mergedMap.set(r.userId, r); });
+      workforceState.forEach((val, key) => mergedMap.set(key, val));
+
+      const arr = Array.from(mergedMap.values());
       fs.writeFileSync(CACHE_FILE, JSON.stringify(arr, null, 2), 'utf-8');
     } catch (err) {
       // Non-blocking
@@ -255,6 +292,7 @@ async function startServer() {
 
   // Periodic stale presence check (every 15 seconds)
   setInterval(() => {
+    syncWorkforceState();
     let changed = false;
     const now = Date.now();
     workforceState.forEach((rec) => {
@@ -267,9 +305,14 @@ async function startServer() {
           changed = true;
           broadcastWorkforceEvent('presence.updated', {
             userId: rec.userId,
+            employeeCode: rec.employeeCode,
+            name: rec.name,
+            email: rec.email,
+            role: rec.role,
             isOnline: false,
             lastSeenAt: rec.lastSeenAt,
-            isSharingLocation: false
+            isSharingLocation: false,
+            status: 'offline'
           });
         }
       }
@@ -319,17 +362,21 @@ async function startServer() {
 
   // Find existing employee record by ID, email, or employeeCode
   function findExistingWorkforceRecord(userId: string, email?: string, employeeCode?: string): WorkforceRecord | undefined {
+    syncWorkforceState();
     if (userId && workforceState.has(userId)) return workforceState.get(userId);
-    const cleanEmail = email?.trim().toLowerCase();
-    const cleanCode = employeeCode?.trim().toLowerCase();
-    if (cleanEmail || cleanCode) {
-      for (const rec of workforceState.values()) {
-        if (cleanEmail && rec.email && rec.email.trim().toLowerCase() === cleanEmail) {
-          return rec;
-        }
-        if (cleanCode && rec.employeeCode && rec.employeeCode.trim().toLowerCase() === cleanCode) {
-          return rec;
-        }
+    const cleanId = userId ? userId.trim().toLowerCase() : '';
+    const cleanEmail = email ? email.trim().toLowerCase() : '';
+    const cleanCode = employeeCode ? employeeCode.trim().toLowerCase() : '';
+
+    for (const rec of workforceState.values()) {
+      if (cleanId && rec.userId && rec.userId.trim().toLowerCase() === cleanId) {
+        return rec;
+      }
+      if (cleanEmail && rec.email && rec.email.trim().toLowerCase() === cleanEmail) {
+        return rec;
+      }
+      if (cleanCode && rec.employeeCode && rec.employeeCode.trim().toLowerCase() === cleanCode) {
+        return rec;
       }
     }
     return undefined;
@@ -342,6 +389,7 @@ async function startServer() {
       return;
     }
 
+    syncWorkforceState();
     const now = Date.now();
     const records = Array.from(workforceState.values()).map((rec) => {
       const lastSeen = rec.lastSeenAt ? new Date(rec.lastSeenAt).getTime() : 0;
@@ -349,7 +397,11 @@ async function startServer() {
       return {
         ...rec,
         isOnline,
-        status: !isOnline ? 'offline' : rec.status === 'moving' ? 'moving' : rec.hasLocation ? (rec.speed && rec.speed > 3 ? 'moving' : 'idle') : 'online'
+        status: !isOnline
+          ? 'offline'
+          : rec.hasLocation && typeof rec.latitude === 'number' && typeof rec.longitude === 'number'
+          ? (rec.speed && rec.speed > 3 ? 'moving' : 'idle')
+          : 'online'
       };
     });
 
@@ -403,6 +455,8 @@ async function startServer() {
         return;
       }
 
+      console.log(`[Presence] heartbeat received ${callerUserId || email || employeeCode}`);
+
       const rawId = callerUserId ? String(callerUserId).trim() : '';
       const existing = findExistingWorkforceRecord(rawId, email, employeeCode);
       const targetId = existing?.userId || rawId;
@@ -410,8 +464,8 @@ async function startServer() {
 
       const updated: WorkforceRecord = {
         userId: targetId,
-        employeeCode: employeeCode || existing?.employeeCode,
-        name: name || existing?.name,
+        employeeCode: employeeCode || existing?.employeeCode || targetId,
+        name: name || existing?.name || (targetId.startsWith('emp-') ? `Field Worker (${targetId})` : 'Solar Worker'),
         email: email || existing?.email,
         role: role || existing?.role || 'Field Engineer',
         latitude: existing?.latitude,
@@ -421,16 +475,24 @@ async function startServer() {
         speed: existing?.speed,
         batteryLevel: existing?.batteryLevel,
         activity: existing?.activity,
-        updatedAt: existing?.updatedAt || timestamp,
+        updatedAt: timestamp,
         lastSeenAt: timestamp,
         isOnline: true,
-        isSharingLocation: typeof isSharingLocation === 'boolean' ? isSharingLocation : (existing?.isSharingLocation ?? true),
-        hasLocation: existing?.hasLocation ?? false,
-        status: existing?.hasLocation ? (existing.speed && existing.speed > 3 ? 'moving' : 'idle') : 'online'
+        isSharingLocation: typeof isSharingLocation === 'boolean' ? isSharingLocation : (existing?.isSharingLocation ?? false),
+        hasLocation: Boolean(existing?.hasLocation && typeof existing?.latitude === 'number' && typeof existing?.longitude === 'number'),
+        status: existing?.hasLocation && typeof existing?.latitude === 'number' && typeof existing?.longitude === 'number'
+          ? (existing.speed && existing.speed > 3 ? 'moving' : 'idle')
+          : 'online'
       };
+
+      // Clean up duplicate old keys if rawId was an alias
+      if (rawId && rawId !== targetId && workforceState.has(rawId)) {
+        workforceState.delete(rawId);
+      }
 
       workforceState.set(targetId, updated);
       persistWorkforceState();
+      console.log(`[Presence] workforce state updated ${targetId}`);
 
       // Broadcast presence update with full metadata
       const presencePayload = {
@@ -448,6 +510,7 @@ async function startServer() {
         status: updated.status
       };
       await broadcastWorkforceEvent('presence.updated', presencePayload);
+      console.log(`[Presence] presence.updated broadcast ${targetId}`);
 
       res.json({
         success: true,
@@ -558,12 +621,13 @@ async function startServer() {
         batteryLevel: batteryLevel !== undefined ? Number(batteryLevel) : undefined
       };
 
-      // Persist in workforceState
-      const existing = workforceState.get(id);
+      // Persist in workforceState with canonical id resolution
+      const existing = findExistingWorkforceRecord(id, undefined, employeeCode);
+      const targetId = existing?.userId || id;
       const updatedRecord: WorkforceRecord = {
-        userId: id,
-        employeeCode: employeeCode || existing?.employeeCode,
-        name: name || existing?.name,
+        userId: targetId,
+        employeeCode: employeeCode || existing?.employeeCode || targetId,
+        name: name || existing?.name || `Field Worker (${targetId})`,
         role: role || existing?.role || 'Field Engineer',
         latitude: numLat,
         longitude: numLng,
@@ -580,8 +644,14 @@ async function startServer() {
         status: isMoving ? 'moving' : 'idle'
       };
 
-      workforceState.set(id, updatedRecord);
+      if (id !== targetId && workforceState.has(id)) {
+        workforceState.delete(id);
+      }
+
+      workforceState.set(targetId, updatedRecord);
       persistWorkforceState();
+
+      payload.userId = targetId;
 
       // Broadcast to both Pusher and Server-Sent Events
       await broadcastWorkforceEvent('location.updated', payload);
